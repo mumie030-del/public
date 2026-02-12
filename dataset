@@ -1,0 +1,246 @@
+import json
+import os
+import glob
+from os.path import join
+from typing import List, Optional, Tuple
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image, ImageDraw
+
+
+class NpyDatasets(Dataset):
+    def __init__(self, data_root, target_size=None):
+        """
+        Args:
+            data_root: 数据根目录
+            target_size: 目标尺寸 (H, W)，如果为None则不调整大小
+        """
+        self.data_root = data_root
+        self.imgs_path = join(data_root, 'images')
+        self.masks_path = join(data_root, 'masks')
+        self.img_files = sorted(glob.glob(join(self.imgs_path, '*.tiff')))
+        self.target_size = target_size
+        print(f"找到 {len(self.img_files)} 个图像文件")
+    
+    def __getitem__(self, index):
+        img_path = self.img_files[index]
+        # images 目录里当前是 .tiff，因此用 PIL 读取；如果你放的是 .npy，请把 glob 改成 *.npy 并用 np.load
+        img = np.array(Image.open(img_path))
+        img_basename = os.path.basename(img_path)
+        mask_path = join(self.masks_path, img_basename)
+        # masks 目录里如果是图片，按图片读；如果是 .npy 则用 np.load
+        if mask_path.lower().endswith(".npy"):
+            mask = np.load(mask_path, allow_pickle=True)
+        else:
+            mask = np.array(Image.open(mask_path))
+        
+        # 确保图像有通道维度，并转换为 (C, H, W)
+        if len(img.shape) == 2:  # (H, W)
+            img = img[:, :, np.newaxis]  # (H, W, 1)
+        elif len(img.shape) == 3:
+            # 如果通道数超过3，保留所有通道（用于多通道输入，如26通道）
+            # 如果通道数正好是3或更少，保持原样
+            pass
+        
+        # 转换为 PyTorch 格式 (C, H, W)
+        if len(img.shape) == 3:
+            img = np.transpose(img, (2, 0, 1))
+        # 掩码保持为 (H, W)，如果是多通道则转换为单通道
+        if len(mask.shape) == 3:
+            mask = mask[:, :, 0] if mask.shape[2] == 1 else np.mean(mask, axis=2)
+        
+        # 转换为 tensor 并归一化
+        img = torch.from_numpy(img).float()
+        if img.max() > 1.0:
+            img = img / 255.0  # 归一化到 [0, 1]
+        
+        mask = torch.from_numpy(mask).float()
+        if mask.max() > 1.0:
+            mask = mask / 255.0  # 归一化到 [0, 1]
+        
+        # 如果需要调整大小，统一图像和掩码的尺寸
+        if self.target_size is not None:
+            # img shape: (C, H, W), mask shape: (H, W)
+            # 需要添加 batch 维度进行插值: (1, C, H, W) 和 (1, 1, H, W)
+            img = img.unsqueeze(0)  # (1, C, H, W)
+            mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            
+            # 使用双线性插值调整大小
+            img = F.interpolate(img, size=self.target_size, mode='bilinear', align_corners=False)
+            mask = F.interpolate(mask, size=self.target_size, mode='nearest')
+            
+            # 移除 batch 维度，但保留通道维度
+            img = img.squeeze(0)  # (C, H, W)
+            mask = mask.squeeze(0)  # (1, H, W) - 保留通道维度
+        else:
+            # 如果没有调整大小，也需要添加通道维度
+            if len(mask.shape) == 2:  # (H, W)
+                mask = mask.unsqueeze(0)  # (1, H, W)
+        
+        return img, mask
+    
+    def __len__(self):
+        return len(self.img_files)
+
+
+def _load_tiff_gray(path: str) -> np.ndarray:
+    """读取 tiff/tif，返回 (H,W) float32。"""
+    arr = np.array(Image.open(path))
+    if arr.ndim == 3:
+        if arr.shape[2] == 1:
+            arr = arr[:, :, 0]
+        else:
+            arr = np.mean(arr, axis=2)
+    return arr.astype(np.float32)
+
+
+def _labelme_json_to_mask(json_path: str, hw: Tuple[int, int]) -> np.ndarray:
+    """LabelMe polygon json -> mask (H,W)，前景为255。"""
+    h, w = hw
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    mask_img = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask_img)
+    for shape in data.get("shapes", []):
+        if shape.get("shape_type") != "polygon":
+            continue
+        pts = shape.get("points", [])
+        poly = [(int(p[0]), int(p[1])) for p in pts]
+        if len(poly) >= 3:
+            draw.polygon(poly, fill=255)
+    return np.array(mask_img, dtype=np.float32)
+
+
+class PerFolder26ChannelDataset(Dataset):
+    """
+    你的目标版本：
+    - 遍历 data3/per*/images/
+    - 每个 per 的 images 里 26 张 tiff 全部作为 26 个通道输入
+    - mask 从该 per/masks/ 读取（优先匹配同名json，否则用唯一json，否则全0）
+    """
+
+    def __init__(self, data_root: str, target_size: Optional[Tuple[int, int]] = None, num_channels: int = 26):
+        
+        self.data_root = data_root
+        self.target_size = target_size
+        self.num_channels = num_channels
+        
+        # 查找所有包含 images 子文件夹的目录（支持 per* 和纯数字文件夹）
+        all_dirs = [d for d in os.listdir(data_root) if os.path.isdir(join(data_root, d))]
+        self.per_dirs: List[str] = []
+        for d in all_dirs:
+            full_path = join(data_root, d)
+            images_dir = join(full_path, "images")
+            if os.path.isdir(images_dir):
+                self.per_dirs.append(full_path)
+        
+        self.per_dirs = sorted(self.per_dirs)
+        if len(self.per_dirs) == 0:
+            raise ValueError(f"在 {data_root} 下未找到包含 images 子文件夹的目录")
+        
+        # 只保留那些 images 里恰好有 num_channels 张图片的 per
+        # 支持多种图片格式：.tiff, .tif, .jpg, .jpeg
+        self.samples: List[Tuple[str, List[str], List[str]]] = []
+        for per in self.per_dirs:
+            images_dir = join(per, "images")
+            masks_dir = join(per, "masks")
+            # 查找所有支持的图片格式
+            image_files = (
+                sorted(glob.glob(join(images_dir, "*.tif*"))) +
+                sorted(glob.glob(join(images_dir, "*.jpg"))) +
+                sorted(glob.glob(join(images_dir, "*.jpeg")))
+            )
+            # 不满足数量的 per 直接跳过（避免整个训练被一个坏样本卡死）
+            if len(image_files) != num_channels:
+                continue
+            jsons = sorted(glob.glob(join(masks_dir, "*.json")))
+            self.samples.append((per, image_files, jsons))
+
+        if len(self.samples) == 0:
+            raise ValueError(f"没有找到 images 下包含 {num_channels} 张 tiff 的 per* 目录")
+
+        print(f"找到 {len(self.samples)} 个 per 样本；每个样本 {num_channels} 通道")
+
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, index):
+        per, tiff_paths, json_paths = self.samples[index]
+
+        # 26通道输入: (C,H,W)
+        chans = [_load_tiff_gray(p) for p in tiff_paths]
+        img_hwc = np.stack(chans, axis=2)  # (H,W,C)
+        img_chw = np.transpose(img_hwc, (2, 0, 1))  # (C,H,W)
+        
+        # mask: 优先找“与某一张tiff同名”的 json（比如 126.tiff -> 126.json）
+        h, w = chans[0].shape
+        mask_hw = None
+        if len(json_paths) > 0:
+            base_candidates = {os.path.splitext(os.path.basename(p))[0] for p in tiff_paths}
+            for jp in json_paths:
+                jbase = os.path.splitext(os.path.basename(jp))[0]
+                if jbase in base_candidates:
+                    mask_hw = _labelme_json_to_mask(jp, (h, w))
+                    break
+            if mask_hw is None and len(json_paths) == 1:
+                mask_hw = _labelme_json_to_mask(json_paths[0], (h, w))
+
+        if mask_hw is None:
+            mask_hw = np.zeros((h, w), dtype=np.float32)
+        
+        # to tensor + normalize
+        img = torch.from_numpy(img_chw).float()
+        img_max = float(img.max()) if img.numel() else 0.0
+        if img_max > 1000:
+            img = img / 65535.0
+        elif img_max > 1.0:
+            img = img / 255.0
+        
+        mask = torch.from_numpy(mask_hw).float()
+        if float(mask.max()) > 1.0:
+            mask = mask / 255.0
+        
+        if self.target_size is not None:
+            img = img.unsqueeze(0)  # (1,C,H,W)
+            mask = mask.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+            img = F.interpolate(img, size=self.target_size, mode="bilinear", align_corners=False)
+            mask = F.interpolate(mask, size=self.target_size, mode="nearest")
+            img = img.squeeze(0)  # (C,H,W)
+            mask = mask.squeeze(0)  # (1,H,W)
+        else:
+            mask = mask.unsqueeze(0)  # (1,H,W)
+        
+        return img, mask
+
+
+if __name__ == "__main__":
+    # 测试原始数据集
+    print("=" * 50)
+    print("测试 NpyDatasets:")
+    print("=" * 50)
+    tr_datasets = NpyDatasets('data')
+    tr_dataloader = DataLoader(tr_datasets, batch_size=1, shuffle=True)
+    for batch_idx, (image, mask) in enumerate(tr_dataloader):
+        print(f"Batch {batch_idx}: image.shape={image.shape}, mask.shape={mask.shape}")
+    
+    print(f"\n总共处理了 {len(tr_dataloader)} 个batch")
+    
+    # 测试 per->26通道 数据集
+    print("\n" + "=" * 50)
+    print("测试 PerFolder26ChannelDataset:")
+    print("=" * 50)
+    try:
+        ds = PerFolder26ChannelDataset(
+            data_root="/DATA/disk2/qiantai/muyan/data3",
+            target_size=(256, 256),
+            num_channels=26,
+        )
+        dl = DataLoader(ds, batch_size=1, shuffle=False)
+        img, m = next(iter(dl))
+        print(f"image.shape={img.shape}, mask.shape={m.shape}")
+    except Exception as e:
+        print(f"测试 PerFolder26ChannelDataset 时出错: {e}")
+
+
