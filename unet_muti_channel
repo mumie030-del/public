@@ -1,0 +1,134 @@
+import argparse
+import os
+from typing import Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from PIL import Image
+
+from datasets import PerFolder26ChannelDataset
+from unet_module import Unet
+
+
+def dice_iou(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> Tuple[float, float]:
+    """
+    pred/target: (B,1,H,W) 0/1
+    """
+    pred = pred.float()
+    target = target.float()
+    inter = (pred * target).sum(dim=(1, 2, 3))
+    union = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) - inter
+    dice = (2 * inter + eps) / (pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3)) + eps)
+    iou = (inter + eps) / (union + eps)
+    return float(dice.mean().item()), float(iou.mean().item())
+
+
+def save_overlay(img_26chw: torch.Tensor, gt_1hw: torch.Tensor, pr_1hw: torch.Tensor, out_path: str) -> None:
+    """
+    用第0通道作为底图，保存一张简单的对比图：
+    左：原图(通道0)，中：GT mask，右：Pred mask
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # 取第0通道做展示
+    base = img_26chw[0].detach().cpu().numpy()
+    base = (base - base.min()) / (base.max() - base.min() + 1e-8)
+    base_u8 = (base * 255).astype(np.uint8)
+
+    gt = gt_1hw[0].detach().cpu().numpy()
+    pr = pr_1hw[0].detach().cpu().numpy()
+    gt_u8 = (gt * 255).astype(np.uint8)
+    pr_u8 = (pr * 255).astype(np.uint8)
+
+    # 拼成一张 (H, 3W)
+    h, w = base_u8.shape
+    canvas = np.zeros((h, w * 3), dtype=np.uint8)
+    canvas[:, 0:w] = base_u8
+    canvas[:, w:2 * w] = gt_u8
+    canvas[:, 2 * w:3 * w] = pr_u8
+
+    Image.fromarray(canvas).save(out_path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, default="/DATA/disk2/qiantai/muyan/data3")
+    parser.add_argument("--model_path", type=str, default="/DATA/disk2/qiantai/muyan/unet/checkpoints/unet_multichannel_final.pth")
+    parser.add_argument("--target_size", type=int, nargs=2, default=[256, 256])
+    parser.add_argument("--num_channels", type=int, default=26)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--save_vis", action="store_true", help="保存可视化结果到 eval_vis/")
+    parser.add_argument("--vis_n", type=int, default=8)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+
+    ds = PerFolder26ChannelDataset(
+        data_root=args.data_root,
+        target_size=tuple(args.target_size),
+        num_channels=args.num_channels,
+    )
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    # 检查模型文件是否存在
+    if not os.path.exists(args.model_path):
+        print(f"错误: 模型文件不存在: {args.model_path}")
+        print("\n请先训练模型，或者使用 --model_path 指定正确的模型路径")
+        print("训练命令示例:")
+        print("  CUDA_VISIBLE_DEVICES=0 python train_multichannel.py")
+        return
+    
+    model = Unet(in_channels=args.num_channels, out_channels=1).to(device)
+    print(f"加载模型: {args.model_path}")
+    ckpt = torch.load(args.model_path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt)
+    model.eval()
+    print("模型加载成功")
+
+    crit = nn.BCEWithLogitsLoss()
+
+    total_loss = 0.0
+    total_dice = 0.0
+    total_iou = 0.0
+    n = 0
+
+    with torch.no_grad():
+        for bi, (images, masks) in enumerate(dl):
+            images = images.to(device)          # (B,26,H,W)
+            masks = masks.to(device)            # (B,1,H,W)
+
+            logits = model(images)              # (B,1,H,W)
+            loss = crit(logits, masks)
+
+            probs = torch.sigmoid(logits)
+            preds = (probs > args.threshold).float()
+
+            dice, iou = dice_iou(preds, (masks > 0.5).float())
+
+            total_loss += float(loss.item())
+            total_dice += dice
+            total_iou += iou
+            n += 1
+
+            if args.save_vis and bi < args.vis_n:
+                out_path = os.path.join("eval_vis", f"sample_{bi}.png")
+                save_overlay(images[0].cpu(), masks[0].cpu(), preds[0].cpu(), out_path)
+
+    print("==== 评估汇总 ====")
+    print(f"样本数: {n}")
+    print(f"Avg Loss: {total_loss / max(n, 1):.4f}")
+    print(f"Avg Dice: {total_dice / max(n, 1):.4f}")
+    print(f"Avg IoU : {total_iou / max(n, 1):.4f}")
+    if args.save_vis:
+        print("可视化已保存到: eval_vis/")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
