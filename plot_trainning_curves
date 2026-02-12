@@ -1,0 +1,184 @@
+"""
+绘制训练loss曲线并检测过拟合
+"""
+import json
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import argparse
+
+
+def load_history(history_path):
+    """加载训练历史"""
+    if not os.path.exists(history_path):
+        raise FileNotFoundError(f"Loss历史文件不存在: {history_path}")
+    
+    with open(history_path, 'r') as f:
+        history = json.load(f)
+    
+    return history
+
+
+def detect_overfitting(history, window=5):
+    """
+    检测过拟合
+    过拟合特征：
+    1. 训练loss持续下降，但验证loss开始上升或停滞
+    2. 训练loss和验证loss差距逐渐增大
+    """
+    train_loss = np.array(history['train_loss'])
+    val_loss = np.array(history['val_loss'])
+    epochs = np.array(history['epoch'])
+    
+    # 计算最近N个epoch的趋势
+    if len(train_loss) < window:
+        return None, "数据点不足，无法判断"
+    
+    # 训练loss趋势（最近N个epoch的平均变化）
+    train_trend = np.mean(np.diff(train_loss[-window:]))
+    
+    # 验证loss趋势
+    val_trend = np.mean(np.diff(val_loss[-window:]))
+    
+    # 训练和验证loss的差距
+    gap = val_loss - train_loss
+    gap_trend = np.mean(np.diff(gap[-window:]))
+    
+    # 判断过拟合
+    is_overfitting = False
+    warning_msg = ""
+    
+    if val_trend > 0 and train_trend < 0:
+        is_overfitting = True
+        warning_msg = f"⚠️ 检测到过拟合！训练loss下降({train_trend:.4f})，但验证loss上升({val_trend:.4f})"
+    elif gap_trend > 0.01:
+        is_overfitting = True
+        warning_msg = f"⚠️ 检测到过拟合！训练和验证loss差距在增大({gap_trend:.4f})"
+    elif val_trend > 0.001:
+        warning_msg = f"⚠️ 警告：验证loss有上升趋势({val_trend:.4f})，可能出现过拟合"
+    else:
+        warning_msg = "✅ 训练正常，未检测到明显过拟合"
+    
+    # 找到验证loss最低的epoch
+    best_epoch_idx = np.argmin(val_loss)
+    best_epoch = epochs[best_epoch_idx]
+    best_val_loss = val_loss[best_epoch_idx]
+    
+    return {
+        'is_overfitting': is_overfitting,
+        'warning': warning_msg,
+        'best_epoch': int(best_epoch),
+        'best_val_loss': float(best_val_loss),
+        'train_trend': float(train_trend),
+        'val_trend': float(val_trend),
+        'gap_trend': float(gap_trend),
+        'final_gap': float(gap[-1])
+    }, None
+
+
+def plot_curves(history, save_path='checkpoints/training_curves.png', show_plot=True):
+    """绘制训练曲线"""
+    epochs = history['epoch']
+    train_loss = history['train_loss']
+    val_loss = history['val_loss']
+    
+    plt.figure(figsize=(12, 5))
+    
+    # 子图1: Loss曲线
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_loss, 'b-', label='Train Loss', linewidth=2)
+    plt.plot(epochs, val_loss, 'r-', label='Val Loss', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    
+    # 标记最佳验证loss点
+    best_idx = np.argmin(val_loss)
+    best_epoch = epochs[best_idx]
+    best_val = val_loss[best_idx]
+    plt.plot(best_epoch, best_val, 'go', markersize=10, label=f'Best Val Loss: {best_val:.4f}')
+    plt.annotate(f'Epoch {best_epoch}\nLoss: {best_val:.4f}', 
+                xy=(best_epoch, best_val), 
+                xytext=(10, 10), 
+                textcoords='offset points',
+                bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.7),
+                arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
+    
+    # 子图2: Loss差距（过拟合指标）
+    plt.subplot(1, 2, 2)
+    gap = np.array(val_loss) - np.array(train_loss)
+    plt.plot(epochs, gap, 'g-', label='Val Loss - Train Loss', linewidth=2)
+    plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss Gap', fontsize=12)
+    plt.title('Overfitting Indicator (Gap between Val and Train)', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    
+    # 如果差距在增大，用红色区域标记
+    if len(gap) > 5:
+        recent_gap = gap[-5:]
+        if np.mean(np.diff(recent_gap)) > 0:
+            plt.fill_between(epochs[-5:], gap[-5:], alpha=0.3, color='red', label='Increasing Gap')
+    
+    plt.tight_layout()
+    
+    # 保存图片
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"训练曲线已保存到: {save_path}")
+    
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='绘制训练loss曲线并检测过拟合')
+    parser.add_argument('--history_path', type=str, 
+                       default='checkpoints/training_history.json',
+                       help='训练历史JSON文件路径')
+    parser.add_argument('--save_path', type=str,
+                       default='checkpoints/training_curves.png',
+                       help='保存图片的路径')
+    parser.add_argument('--no_show', action='store_true',
+                       help='不显示图片，只保存')
+    
+    args = parser.parse_args()
+    
+    # 加载历史
+    try:
+        history = load_history(args.history_path)
+        print(f"成功加载训练历史: {args.history_path}")
+        print(f"总训练轮数: {len(history['epoch'])}")
+    except FileNotFoundError as e:
+        print(f"错误: {e}")
+        print("\n请先运行 train_with_validation.py 进行训练，生成loss历史文件")
+        return
+    
+    # 检测过拟合
+    overfitting_info, error = detect_overfitting(history)
+    if error:
+        print(error)
+    else:
+        print("\n" + "="*60)
+        print("过拟合检测结果:")
+        print("="*60)
+        print(overfitting_info['warning'])
+        print(f"最佳验证loss: {overfitting_info['best_val_loss']:.4f} (Epoch {overfitting_info['best_epoch']})")
+        print(f"训练loss趋势: {overfitting_info['train_trend']:.4f}")
+        print(f"验证loss趋势: {overfitting_info['val_trend']:.4f}")
+        print(f"Loss差距趋势: {overfitting_info['gap_trend']:.4f}")
+        print(f"最终loss差距: {overfitting_info['final_gap']:.4f}")
+        print("="*60)
+    
+    # 绘制曲线
+    plot_curves(history, save_path=args.save_path, show_plot=not args.no_show)
+
+
+if __name__ == '__main__':
+    main()
+
