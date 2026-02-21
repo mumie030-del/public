@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 模型权重和检查点（通常很大，不推荐上传）
+checkpoints/*.pth
+checkpoints/*.pt
+*.pth
+*.pt
+
+# 测试结果图片（可选，如果不想上传）
+test_results/
+*.png
+*.jpg
+*.jpeg
+
+# 数据集（通常很大，不推荐上传）
+data3/
+*.npy
+*.npz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 日志
+*.log
+logs/
+
+# 环境
+venv/
+env/
+ENV/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 训练曲线（可选）
+training_curves.png
+
