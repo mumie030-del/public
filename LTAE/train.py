@@ -6,14 +6,24 @@ from torch.utils.data import DataLoader, random_split
 from datasets import Data3Dataset
 from tqdm import tqdm
 from module import UnetWithLTAE
+import random, numpy as np
 # ==================== 配置参数 ====================
 DATA_DIR = '../data3'
 BATCH_SIZE = 2
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 100
+NUM_EPOCHS = 200
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 CHECKPOINT_DIR = './checkpoints'
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+
+def set_seed(seed: int = 42):
+    """固定所有相关随机种子，保证划分和初始化可复现"""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class DiceLoss(nn.Module):
@@ -46,10 +56,42 @@ class BceDiceLoss(nn.Module):
 
 criterion = BceDiceLoss()
 
+
+def compute_binary_dice(logits, targets, threshold: float = 0.5, eps: float = 1e-5) -> float:
+    """根据 logits 和 GT 计算批量 Dice（用于监控，不参与反向传播）"""
+    probs = torch.sigmoid(logits)
+    preds = (probs > threshold).float()
+
+    preds_flat = preds.view(preds.size(0), -1)
+    targets_flat = targets.view(targets.size(0), -1)
+
+    intersection = (preds_flat * targets_flat).sum(dim=1)
+    dice = (2.0 * intersection + eps) / (
+        preds_flat.sum(dim=1) + targets_flat.sum(dim=1) + eps
+    )
+    return dice.mean().item()
+
+
+def compute_binary_iou(logits, targets, threshold: float = 0.5, eps: float = 1e-5) -> float:
+    """根据 logits 和 GT 计算批量 IoU（Intersection over Union）"""
+    probs = torch.sigmoid(logits)
+    preds = (probs > threshold).float()
+
+    preds_flat = preds.view(preds.size(0), -1)
+    targets_flat = targets.view(targets.size(0), -1)
+
+    intersection = (preds_flat * targets_flat).sum(dim=1)
+    union = preds_flat.sum(dim=1) + targets_flat.sum(dim=1) - intersection
+    iou = (intersection + eps) / (union + eps)
+    return iou.mean().item()
+
 # ==================== 主训练流程 ====================
 if __name__ == '__main__':
     print(f"使用设备: {DEVICE}")
-    
+
+    # 0. 固定随机种子（保证每次运行划分一致）
+    set_seed(42)
+
     # 1. 加载数据集
     dataset = Data3Dataset(data_root=DATA_DIR, target_size=(256, 256), num_channels=26)
     print(f"总数据集大小: {len(dataset)}")
@@ -57,7 +99,9 @@ if __name__ == '__main__':
     # 2. 划分训练集和验证集 (75% 训练, 25% 验证)
     train_size = int(0.75 * len(dataset))
     val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    # 使用固定 generator，保证每次划分出的索引完全一致
+    g = torch.Generator().manual_seed(42)
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=g)
     print(f"训练集大小: {len(train_dataset)}, 验证集大小: {len(val_dataset)}")
     
     # 3. 创建 DataLoader
@@ -114,6 +158,9 @@ if __name__ == '__main__':
         # ========== 验证阶段 ==========
         model.eval()
         val_loss = 0.0
+        val_dice = 0.0
+        val_iou = 0.0
+        val_batches = 0
         
         with torch.no_grad():
             val_bar = tqdm(val_loader, desc=f'Epoch {epoch+1}/{NUM_EPOCHS} [Val]')
@@ -125,9 +172,18 @@ if __name__ == '__main__':
                 loss = criterion(outputs, masks)
                 
                 val_loss += loss.item()
-                val_bar.set_postfix({'loss': loss.item()})
+                # 计算本 batch 的 Dice / IoU（阈值与测试脚本保持一致，这里使用 0.5）
+                batch_dice = compute_binary_dice(outputs, masks, threshold=0.5)
+                batch_iou = compute_binary_iou(outputs, masks, threshold=0.5)
+                val_dice += batch_dice
+                val_iou += batch_iou
+                val_batches += 1
+
+                val_bar.set_postfix({'loss': loss.item(), 'dice': batch_dice, 'iou': batch_iou})
         
         avg_val_loss = val_loss / len(val_loader)
+        avg_val_dice = val_dice / max(val_batches, 1)
+        avg_val_iou = val_iou / max(val_batches, 1)
         
         # 更新学习率
         scheduler.step(avg_val_loss)
@@ -136,6 +192,8 @@ if __name__ == '__main__':
         print(f'\nEpoch [{epoch+1}/{NUM_EPOCHS}]')
         print(f'  训练损失: {avg_train_loss:.4f}')
         print(f'  验证损失: {avg_val_loss:.4f}')
+        print(f'  验证 Dice: {avg_val_dice:.4f}')
+        print(f'  验证 IoU : {avg_val_iou:.4f}')
         print(f'  学习率: {current_lr:.6f}')
         
         # 保存最佳模型
@@ -148,6 +206,8 @@ if __name__ == '__main__':
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
+                'val_dice': avg_val_dice,
+                'val_iou': avg_val_iou,
             }, checkpoint_path)
             print(f'  ✓ 保存最佳模型到 {checkpoint_path}')
         
@@ -160,6 +220,8 @@ if __name__ == '__main__':
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
+                'val_dice': avg_val_dice,
+                'val_iou': avg_val_iou,
             }, checkpoint_path)
             print(f'  ✓ 保存检查点到 {checkpoint_path}')
         

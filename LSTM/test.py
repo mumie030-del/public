@@ -169,5 +169,7 @@ if __name__ == '__main__':
             plt.close()
     
     avg_dice = total_dice / len(test_loader)
+
+    
     print(f"\n测试完成！平均 Dice: {avg_dice:.4f}")
     print(f"结果保存在: {SAVE_DIR}")
