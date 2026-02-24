@@ -108,52 +108,85 @@ class Unet(nn.Module):
 
 
 # 3. CBAM 注意力机制组件
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+# class ChannelAttention(nn.Module):
+#     def __init__(self, in_planes, ratio=16):
+#         super(ChannelAttention, self).__init__()
+#         self.avg_pool = nn.AdaptiveAvgPool2d(1)
+#         self.max_pool = nn.AdaptiveMaxPool2d(1)
         
-        # 共享感知层
-        self.fc1   = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
-        self.relu1 = nn.ReLU()
-        self.fc2   = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+#         # 共享感知层
+#         self.fc1   = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+#         self.relu1 = nn.ReLU()
+#         self.fc2   = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+#         self.sigmoid = nn.Sigmoid()
+
+#     def forward(self, x):
+#         avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+#         max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+#         out = avg_out + max_out
+#         return self.sigmoid(out)
+
+
+# class SpatialAttention(nn.Module):
+#     def __init__(self, kernel_size=7):
+#         super(SpatialAttention, self).__init__()
+#         # 压缩通道，只看空间
+#         self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+#         self.sigmoid = nn.Sigmoid()
+
+#     def forward(self, x):
+#         # 在通道维度做平均和最大池化
+#         avg_out = torch.mean(x, dim=1, keepdim=True)
+#         max_out, _ = torch.max(x, dim=1, keepdim=True)
+#         x = torch.cat([avg_out, max_out], dim=1)
+#         x = self.conv1(x)
+#         return self.sigmoid(x)
+
+
+# class CBAM(nn.Module):
+#     def __init__(self, channel, ratio=16):
+#         super(CBAM, self).__init__()
+#         self.ca = ChannelAttention(channel, ratio)
+#         self.sa = SpatialAttention()
+
+#     def forward(self, x):
+#         identity = x                # 保存原始特征
+#         out = x * self.ca(x)        # 通道注意力
+#         out = out * self.sa(out)    # 空间注意力
+#         return identity + out       # 【关键修改】：残差相加！(原始特征 + 注意力特征)
+
+
+
+
+
+import torch
+import torch.nn as nn
+import math
+
+class ECABlock(nn.Module):
+    """
+    ECA 注意力模块：使用 1D 卷积代替全连接层，完美保留通道(时间)的拓扑顺序
+    """
+    def __init__(self, channels, gamma=2, b=1):
+        super(ECABlock, self).__init__()
+        # 自动计算自适应的一维卷积核大小
+        kernel_size = int(abs((math.log(channels, 2) + b) / gamma))
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # 使用 1D 卷积处理通道维度，捕捉相邻帧的关系
+        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        # 压缩通道，只看空间
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        # 在通道维度做平均和最大池化
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
-        return self.sigmoid(x)
-
-
-class CBAM(nn.Module):
-    def __init__(self, channel, ratio=16):
-        super(CBAM, self).__init__()
-        self.ca = ChannelAttention(channel, ratio)
-        self.sa = SpatialAttention()
-
-    def forward(self, x):
-        identity = x                # 保存原始特征
-        out = x * self.ca(x)        # 通道注意力
-        out = out * self.sa(out)    # 空间注意力
-        return identity + out       # 【关键修改】：残差相加！(原始特征 + 注意力特征)
+        # x: (Batch, Channels, H, W)
+        y = self.avg_pool(x) # (Batch, Channels, 1, 1)
+        
+        # 维度变换以适应 Conv1d: (Batch, 1, Channels)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        
+        y = self.sigmoid(y)
+        return x * y.expand_as(x) # 残差乘法
 
 # 4. U-Net + CBAM 融合模型
 # 4. 修剪版 U-Net + CBAM 融合模型

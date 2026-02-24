@@ -4,15 +4,17 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split, Subset
 from datasets import Data3Dataset
-from CBAM import UnetWithCBAM
+# from module import NestedUNet
 from tqdm import tqdm
 import albumentations as A
+from module import OptimizedNestedUNet
+
 
 # ==================== 配置参数 ====================
 DATA_DIR = '../data3'
 BATCH_SIZE = 2
 LEARNING_RATE = 1e-4
-NUM_EPOCHS = 500
+NUM_EPOCHS = 100
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 CHECKPOINT_DIR = './checkpoints'
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -88,9 +90,10 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     
-    # 5. 初始化模型 - 使用 UnetWithCBAM
-    model = UnetWithCBAM(in_channels=26, out_channels=1, use_dropout=False, cbam_ratio=16).to(DEVICE)
-    print(f"模型: UnetWithCBAM (带 CBAM 双重注意力)")
+    # 5. 初始化模型
+    # NestedUNet 的构造参数为 (in_channels, out_channels, deep_supervision)
+    model = OptimizedNestedUNet(in_channels=26, out_channels=1, deep_supervision=True, dropout_rate=0.05).to(DEVICE)
+    print(f"模型: NestedUNet (UNet++)")
     print(f"输入通道数: 26, 输出通道数: 1")
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -125,12 +128,21 @@ if __name__ == '__main__':
         for batch_idx, (images, masks) in enumerate(train_bar):
             images = images.to(DEVICE)
             masks = masks.to(DEVICE)
-            
+
             outputs = model(images)
-            loss = criterion(outputs, masks)
+            # 支持 deep supervision：如果模型返回多个尺度的预测，分别算 loss 后取平均
+            if isinstance(outputs, list):
+                loss = 0
+                for out in outputs:
+                    loss = loss + criterion(out, masks)
+                loss = loss / len(outputs)
+            else:
+                loss = criterion(outputs, masks)
             
             if epoch % 10 == 0 and batch_idx == 0:
-                probs = torch.sigmoid(outputs)
+                # Debug 可视化：如果是 deep supervision，取最后一个输出做统计
+                debug_out = outputs[-1] if isinstance(outputs, list) else outputs
+                probs = torch.sigmoid(debug_out)
                 print(f" [Debug] Max Prob: {probs.max().item():.4f}, Mean Prob: {probs.mean().item():.4f}")
             
             optimizer.zero_grad()
@@ -152,9 +164,15 @@ if __name__ == '__main__':
             for images, masks in val_bar:
                 images = images.to(DEVICE)
                 masks = masks.to(DEVICE)
-                
+
                 outputs = model(images)
-                loss = criterion(outputs, masks)
+                if isinstance(outputs, list):
+                    loss = 0
+                    for out in outputs:
+                        loss = loss + criterion(out, masks)
+                    loss = loss / len(outputs)
+                else:
+                    loss = criterion(outputs, masks)
                 
                 val_loss += loss.item()
                 val_bar.set_postfix({'loss': loss.item()})
