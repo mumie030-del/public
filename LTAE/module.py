@@ -208,6 +208,14 @@ class UnetWithLTAE(nn.Module):
         # 4. 输出
         return self.out_conv(x)
 
+class TAC(nn.Module):
+    def __init__(self, in_channels=26, out_channels=1 ,laten_dim=64):
+        super(TAC, self).__init__()
+        self.unetwithltae=UnetWithLTAE(in_channels=in_channels, out_channels=out_channels)
+        self.diagnostic_head=LatentEncoder
+
+
+
 
 if __name__ == '__main__':
     print("="*60)
