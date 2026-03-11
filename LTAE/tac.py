@@ -1,61 +1,107 @@
+##new
+
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from datasets import Data3Dataset
-# 导入您自己写的 U-Net+LTAE 类
 from module import UnetWithLTAE
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def extract_all_tacs(dataloader, model_weight_path):
+def extract_left_right_tacs(dataloader, model_weight_path):
+    """
+    分别提取左右肾的TAC曲线
+    输出：100个样本（50个病人 × 2侧）
+    """
     print("加载 U-Net 模型权重...")
     model = UnetWithLTAE(in_channels=26, out_channels=1).to(DEVICE)
-    # 训练保存的是完整 checkpoint 字典，需要先取出其中的 model_state_dict
     checkpoint = torch.load(model_weight_path, map_location=DEVICE)
     if "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
     else:
-        # 兼容直接保存 state_dict 的情况
         state_dict = checkpoint
     model.load_state_dict(state_dict)
-    model.eval() # 开启评估模式，冻结权重
+    model.eval()
 
-    all_tacs = []
-    all_labels = []
+    all_left_tacs = []
+    all_right_tacs = []
+    patient_ids = []
 
-    print("开始批量提取 TAC 曲线...")
+    print("开始批量提取左右肾 TAC 曲线...")
     with torch.no_grad():
-        for images, labels in dataloader:
-            images = images.to(DEVICE) # shape: (B, 26, H, W)
-            
-            # 1. 预测掩码
+        for batch_idx, (images, labels) in enumerate(dataloader):
+            images = images.to(DEVICE)  # shape: (B, 26, H, W)
             mask_logits = model(images)
-            soft_mask = torch.sigmoid(mask_logits) # shape: (B, 1, H, W)
-            
-            # 2. 掩码过滤（抹除背景）
+            soft_mask = torch.sigmoid(mask_logits)  # shape: (B, 1, H, W
             masked_images = images * soft_mask 
             
-            # 3. 空间池化，得到 26 维 TAC 曲线
-            # 计算每帧图像在掩码区域内的平均亮度
-            tac_curve = masked_images.mean(dim=(2, 3)) # shape: (B, 26)
-            
-            all_tacs.append(tac_curve.cpu().numpy())
-            all_labels.append(labels.numpy())
+            # 3. 沿中线分离左右肾
+            W_mid = masked_images.shape[3] // 2
 
-    # 将提取出的黄金特征保存为 numpy 数组，供下一步直接读取！
-    final_tacs = np.concatenate(all_tacs, axis=0)
-    final_labels = np.concatenate(all_labels, axis=0)
-    np.save('extracted_tacs.npy', final_tacs)
-    np.save('extracted_labels.npy', final_labels)
-    print(f"提取完成！共保存了 {final_tacs.shape[0]} 条 TAC 曲线。")
+            
+            image_right_kidney = masked_images[:, :, :, :W_mid]
+            image_left_kidney = masked_images[:, :, :, W_mid:]
+            
+            # --- 【修复区：医学常识纠正】 ---
+            # 计算左右半区 Mask 的实际面积 (防止除零)
+            area_right = soft_mask[:, :, :, :W_mid].sum(dim=(2, 3)) + 1e-8 # shape: (B, 1)
+            area_left = soft_mask[:, :, :, W_mid:].sum(dim=(2, 3)) + 1e-8  # shape: (B, 1)
+            
+            # 提取真正的 ROI TAC 曲线：信号总和 / 有效面积
+            tac_right = image_right_kidney.sum(dim=(2, 3)) / area_right    # shape: (B, 26)
+            tac_left = image_left_kidney.sum(dim=(2, 3)) / area_left       # shape: (B, 26)
+            # ---------------------------------
+            
+        
+            # 5. 保存到列表
+            all_right_tacs.append(tac_right.cpu().numpy())
+            all_left_tacs.append(tac_left.cpu().numpy())
+            
+            # 记录病人ID（假设从P001开始）
+            for i in range(images.shape[0]):
+                patient_id = f"P{(batch_idx * images.shape[0] + i + 1):03d}"
+                patient_ids.append(patient_id)
+    
+    # 6. 合并所有批次
+    all_left_tacs = np.concatenate(all_left_tacs, axis=0)   # (50, 26)
+    all_right_tacs = np.concatenate(all_right_tacs, axis=0) # (50, 26)
+    
+    # 7. 交错排列：P001左, P001右, P002左, P002右, ...
+    all_tacs = []
+    kidney_sides = []
+    patient_ids_expanded = []
+    
+    for i in range(len(patient_ids)):
+        # 左肾
+        all_tacs.append(all_left_tacs[i])
+        kidney_sides.append('left')
+        patient_ids_expanded.append(patient_ids[i])
+        
+        # 右肾
+        all_tacs.append(all_right_tacs[i])
+        kidney_sides.append('right')
+        patient_ids_expanded.append(patient_ids[i])
+    
+    all_tacs = np.array(all_tacs)  # (100, 26)
+    
+    # 8. 保存
+    np.save('extracted_tacs_left_right.npy', all_tacs)
+    print(f"✓ 提取完成！共保存了 {all_tacs.shape[0]} 条 TAC 曲线")
+    print(f"  - 50个病人 × 2侧 = 100个样本")
+    print(f"  - 保存到: extracted_tacs_left_right.npy")
+    
+    
+    return all_tacs, patient_ids_expanded, kidney_sides
+
 
 if __name__ == '__main__':
-    # 1. 构建 DataLoader（与训练/测试保持一致的数据预处理）
+    # 1. 构建 DataLoader
     DATA_DIR = '../data3'
     dataset = Data3Dataset(data_root=DATA_DIR, target_size=(256, 256), num_channels=26)
     dataloader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=4)
 
-    # 2. 使用 LTAE 训练得到的最佳权重
+    # 2. 使用训练好的模型权重
     MODEL_PATH = './checkpoints/best_model.pth'
 
-    extract_all_tacs(dataloader, MODEL_PATH)
+    extract_left_right_tacs(dataloader, MODEL_PATH)
+
